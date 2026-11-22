@@ -94,6 +94,8 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
 .meta{display:flex;justify-content:space-between;align-items:center;font-size:.78rem}
 .meta .links{display:flex;flex:none}
 .meta .links .btn{margin-left:12px;font-size:.78rem}
+.meta .links .btn.on{color:var(--beat);font-weight:700}
+.meta .links .btn.on::before{content:"";display:inline-block;width:.5em;height:.5em;margin-right:4px;border-radius:50%;background:currentColor;vertical-align:.08em}
 .bpmform{display:flex;flex-wrap:wrap;align-items:flex-end;margin:8px -4px 0}
 .bpmform .form-group{flex:1 1 7rem;min-width:0;margin:0 4px 6px}
 .bpmform label{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:2px}
@@ -133,7 +135,7 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
       </button>
       <button class="btn btn-outline-secondary btn-sm" id="faster" type="button" aria-label="Faster">+ BPM</button>
     </div>
-    <div class="meta"><span class="text-muted" id="baseInfo">No base tempo yet</span><span class="links"><button class="btn btn-link btn-sm p-0" id="typeBpm" type="button" aria-expanded="false" aria-controls="bpmForm">Type BPM</button><button class="btn btn-link btn-sm p-0" id="resetTempo" type="button">Reset tempo</button></span></div>
+    <div class="meta"><span class="text-muted" id="baseInfo">No base tempo yet</span><span class="links"><button class="btn btn-link btn-sm p-0" id="listen" type="button" aria-pressed="false" title="Find the tempo by listening through the microphone">Listen</button><button class="btn btn-link btn-sm p-0" id="typeBpm" type="button" aria-expanded="false" aria-controls="bpmForm">Type BPM</button><button class="btn btn-link btn-sm p-0" id="resetTempo" type="button">Reset tempo</button></span></div>
     <form class="bpmform" id="bpmForm" hidden novalidate>
       <div class="form-group"><label for="baseIn">Song BPM (1.00×)</label><input type="number" class="form-control form-control-sm" id="baseIn" inputmode="decimal" min="30" max="300" step="0.1" placeholder="e.g. 128"></div>
       <div class="form-group"><label for="curIn">Machine BPM now</label><input type="number" class="form-control form-control-sm" id="curIn" inputmode="decimal" min="30" max="300" step="0.1" placeholder="same as song"></div>
@@ -174,7 +176,7 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
           <label for="paste">Or paste lyrics file / song data</label>
           <textarea class="form-control text-monospace" id="paste" rows="4" style="font-size:13px" placeholder="[Script Info] …   or   { &quot;lyrics&quot;: … }"></textarea>
         </div>
-        <small class="form-text text-muted mt-3">Keys: Space play/pause · B tap beat · ←/→ nudge · [ ] tempo</small>
+        <small class="form-text text-muted mt-3">Keys: Space play/pause · B tap beat · ←/→ nudge · [ ] tempo · L listen</small>
       </div>
       <div class="modal-footer">
         <button class="btn btn-outline-secondary" id="demo" type="button">Use demo</button>
@@ -449,6 +451,7 @@ $("sheet").addEventListener("pointercancel", () => down = null);
 const tempo = {base:null, taps:[], baseSeries:false, anchor:null, lastBeat:null};
 function onBeatTap(){
   const at = now();
+  listenHold();
   if (tempo.taps.length && at - tempo.taps[tempo.taps.length-1] > 2000) tempo.taps = [];
   if (!tempo.taps.length) tempo.baseSeries = tempo.base == null;
   tempo.taps.push(at); if (tempo.taps.length > 9) tempo.taps.shift();
@@ -463,6 +466,7 @@ function onBeatTap(){
   } else updateTempo();
 }
 function nudgeTempo(dir){
+  listenHold();
   if (tempo.base){ const b = Math.round(tempo.base * clk.rate) + dir; setRate(Math.min(1.5, Math.max(0.5, b / tempo.base))); }
   else setRate(Math.round((clk.rate + dir*0.01)*100)/100);
   saveTempo();
@@ -517,6 +521,7 @@ $("bpmForm").addEventListener("submit", e => {
   if (!(base >= 30 && base <= 300) || !(cur >= 30 && cur <= 300)) return err("BPM must be between 30 and 300.");
   const r = cur / base;
   if (r < 0.5 || r > 1.5) return err("Machine BPM must be within half to one and a half times the song BPM.");
+  listenHold();
   tempo.base = base; tempo.taps = []; tempo.baseSeries = false;
   if (tempo.anchor == null) tempo.anchor = songTime();
   setRate(r); saveTempo(); openBpmForm(false);
@@ -535,6 +540,7 @@ function updateTempo(){
     $("padHelp").textContent = "4+ taps sets the base tempo";
     $("baseInfo").textContent = "No base tempo yet";
   }
+  if (listen.on || listen.starting || listen.msg) $("padHelp").textContent = listenStatus();
 }
 function beatFrame(t){
   if (!tempo.base || tempo.anchor == null) return;
@@ -549,7 +555,187 @@ $("pad").addEventListener("pointerdown", e => { e.preventDefault(); onBeatTap();
 $("pad").addEventListener("keydown", e => { if (e.key === "Enter"){ e.preventDefault(); onBeatTap(); } });
 $("slower").onclick = () => nudgeTempo(-1);
 $("faster").onclick = () => nudgeTempo(1);
-$("resetTempo").onclick = () => { tempo.base = null; tempo.taps = []; tempo.anchor = null; setRate(1); saveTempo(); openBpmForm(false); };
+$("resetTempo").onclick = () => { listenHold(); tempo.base = null; tempo.taps = []; tempo.anchor = null; setRate(1); saveTempo(); openBpmForm(false); };
+
+/* ---------- Listen: tempo from the microphone ----------
+   An AudioWorklet turns mic audio into an onset signal: the rise in loudness in three bands
+   (bass, mids, highs) every 256 samples. Once a second the last few seconds of that signal are
+   autocorrelated to find the beat period. A tempo is used only when three readings in a row agree.
+   With a base tempo set, the search stays within 0.5–1.5× of it and favours the current speed,
+   which stops it locking onto half or double time. */
+const ONSET_WORKLET = `
+class Onset extends AudioWorkletProcessor {
+  constructor(){
+    super();
+    this.hop = 256; this.n = 0; this.lp1 = 0; this.lp2 = 0;
+    this.a1 = 1 - Math.exp(-2*Math.PI*200/sampleRate);
+    this.a2 = 1 - Math.exp(-2*Math.PI*2000/sampleRate);
+    this.e = [0,0,0]; this.prev = [0,0,0]; this.out = []; this.peak = 0;
+  }
+  process(inputs){
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++){
+      const x = ch[i];
+      this.lp1 += this.a1*(x - this.lp1); this.lp2 += this.a2*(x - this.lp2);
+      const lo = this.lp1, mid = this.lp2 - this.lp1, hi = x - this.lp2;
+      this.e[0] += lo*lo; this.e[1] += mid*mid; this.e[2] += hi*hi;
+      const ax = x < 0 ? -x : x; if (ax > this.peak) this.peak = ax;
+      if (++this.n === this.hop){
+        let f = 0;
+        for (let b = 0; b < 3; b++){
+          const l = Math.log(this.e[b]/this.hop + 1e-8);
+          if (l > this.prev[b]) f += l - this.prev[b];
+          this.prev[b] = l; this.e[b] = 0;
+        }
+        this.out.push(f); this.n = 0;
+        if (this.out.length === 16){ this.port.postMessage({f: this.out, peak: this.peak}); this.out = []; this.peak = 0; }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("onset", Onset);`;
+
+const LISTEN_SECS = 8;
+const listen = {on:false, starting:false, ctx:null, stream:null, timer:null, fps:0, env:null, n:0, lastAt:0,
+                peak:0, quiet:false, est:[], heard:null, holdUntil:0, msg:"", msgTimer:null};
+
+async function startListening(){
+  if (listen.on || listen.starting) return;
+  const md = navigator.mediaDevices, AC = window.AudioContext || window.webkitAudioContext;
+  if (!md || !md.getUserMedia || !AC || !window.AudioWorkletNode)
+    return listenFail(window.isSecureContext === false ? "Listening needs the page on https" : "This browser can't listen");
+  listen.starting = true; listen.msg = ""; updateListen();
+  const ctx = new AC();                     // created inside the tap, so phones let it run
+  try {
+    const stream = await md.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+    const url = URL.createObjectURL(new Blob([ONSET_WORKLET], {type:"application/javascript"}));
+    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
+    const node = new AudioWorkletNode(ctx, "onset");
+    const mute = ctx.createGain(); mute.gain.value = 0;        // keeps the node running; plays nothing
+    ctx.createMediaStreamSource(stream).connect(node); node.connect(mute); mute.connect(ctx.destination);
+    node.port.onmessage = e => onOnsets(e.data);
+    await ctx.resume();
+    listen.fps = ctx.sampleRate / 256;
+    listen.env = new Float32Array(Math.ceil(listen.fps * LISTEN_SECS));
+    Object.assign(listen, {on:true, starting:false, ctx, stream, n:0, est:[], heard:null, quiet:false, peak:0});
+    stream.getAudioTracks().forEach(t => t.addEventListener("ended", () => listenFail("The microphone stopped")));
+    listen.timer = setInterval(analyseTempo, 1000);
+    wake(); updateListen();
+  } catch(e){
+    ctx.close().catch(() => {});
+    listen.starting = false;
+    listenFail(e && e.name === "NotAllowedError" ? "Microphone access was blocked" : e && e.name === "NotFoundError" ? "No microphone found" : "Couldn't start listening");
+  }
+}
+function stopListening(){
+  clearInterval(listen.timer);
+  if (listen.stream) listen.stream.getTracks().forEach(t => t.stop());
+  if (listen.ctx) listen.ctx.close().catch(() => {});
+  Object.assign(listen, {on:false, starting:false, ctx:null, stream:null, timer:null, heard:null, est:[]});
+  updateListen();
+}
+function listenFail(msg){
+  stopListening();
+  listen.msg = msg; updateListen();
+  clearTimeout(listen.msgTimer); listen.msgTimer = setTimeout(() => { listen.msg = ""; updateTempo(); }, 6000);
+}
+/* A manual tempo change wins: ignore what the mic hears for a few seconds, then start agreeing afresh. */
+function listenHold(){ listen.holdUntil = now() + 8000; listen.est = []; }
+
+function onOnsets(d){
+  const env = listen.env; if (!env) return;
+  for (const f of d.f){ env[listen.n % env.length] = f; listen.n++; }
+  listen.lastAt = now();
+  if (d.peak > listen.peak) listen.peak = d.peak;
+}
+
+/* Tempo from an onset signal x at fps frames/s, searched between lo and hi BPM with a log-normal
+   preference (width sigma) around the expected BPM. Returns {bpm, strength, y} or null. */
+function estimateTempo(x, fps, lo, hi, expected, sigma){
+  const N = x.length;
+  // keep only the peaks above the local average (≈ the beats)
+  const w = Math.round(fps * 0.25), cs = new Float64Array(N + 1), y = new Float64Array(N);
+  for (let i = 0; i < N; i++) cs[i+1] = cs[i] + x[i];
+  for (let i = 0; i < N; i++){ const a = Math.max(0, i - w), b = Math.min(N, i + w + 1); const v = x[i] - (cs[b] - cs[a])/(b - a); y[i] = v > 0 ? v : 0; }
+  const maxLag = Math.min(N - Math.round(fps * 2.5), Math.ceil(fps * 60 / lo * 4) + 2);
+  if (maxLag < fps * 60 / lo * 2) return null;
+  const acf = new Float64Array(maxLag + 1);
+  for (let l = 0; l <= maxLag; l++){ let s = 0; for (let i = 0; i + l < N; i++) s += y[i] * y[i+l]; acf[l] = s / (N - l); }
+  if (!(acf[0] > 0)) return null;
+  const at = l => { const i = Math.floor(l), f = l - i; return i + 1 > maxLag ? 0 : (acf[i]*(1 - f) + acf[i+1]*f) / acf[0]; };
+  let best = null, bestP = 0;
+  for (let b = lo; b <= hi; b += 0.1){
+    const L = fps * 60 / b; let s = 0, k = 1;
+    // strength at each multiple of the period, minus the halfway points (that penalises half-time)
+    for (; k <= 4 && k * L <= maxLag; k++) s += at(k * L) - 0.5 * at((k - 0.5) * L);
+    if (k < 3) continue;
+    s /= k - 1;
+    const p = Math.max(0, s) * Math.exp(-0.5 * (Math.log(b / expected) / sigma) ** 2);
+    if (p > bestP){ bestP = p; best = {bpm: b, strength: s}; }
+  }
+  if (best) best.y = y;
+  return best;
+}
+
+function analyseTempo(){
+  if (!listen.on) return;
+  listen.quiet = listen.peak < 0.002; listen.peak = 0;
+  const {fps, env} = listen, len = env.length, N = Math.min(listen.n, len);
+  let r = null;
+  if (N >= fps * 5 && !listen.quiet){
+    const x = new Float64Array(N), start = listen.n - N;
+    for (let i = 0; i < N; i++) x[i] = env[(start + i) % len];
+    const b = tempo.base;
+    r = b ? estimateTempo(x, fps, b * 0.5, b * 1.5, b * clk.rate, 0.15)
+          : estimateTempo(x, fps, 70, 180, 120, 0.35);
+    if (r && r.strength < 0.2) r = null;      // tested: steady beats score 0.22–0.42, non-beat sound 0.12–0.18
+  }
+  const e = listen.est; e.push(r ? r.bpm : null); if (e.length > 3) e.shift();
+  const m = e.length === 3 && e.every(v => v != null) ? [...e].sort((a, c) => a - c)[1] : null;
+  listen.heard = m != null && e.every(v => Math.abs(v / m - 1) <= 0.015) ? m : null;
+  if (listen.heard != null && now() >= listen.holdUntil) useHeardTempo(listen.heard, r.y);
+  updateTempo();
+}
+function useHeardTempo(bpm, y){
+  let changed = false;
+  if (!tempo.base){ tempo.base = bpm / clk.rate; tempo.taps = []; tempo.baseSeries = false; changed = true; }
+  else {
+    const r = Math.min(1.5, Math.max(0.5, bpm / tempo.base));
+    if (Math.abs(r / clk.rate - 1) > 0.004){ setRate(r); changed = true; }
+  }
+  // line up the beat flash with the beats just heard
+  if (clk.playing && y){
+    const P = listen.fps * 60 / bpm, N = y.length;
+    let bestPh = 0, bv = -1;
+    for (let ph = 0; ph < P; ph++){
+      let s = 0;
+      for (let k = 0; k < 8; k++){ const i = Math.round(N - 1 - ph - k * P); if (i < 0) break; s += y[i]; }
+      if (s > bv){ bv = s; bestPh = ph; }
+    }
+    const beat = songTime(listen.lastAt - bestPh / listen.fps * 1000), period = 60 / tempo.base;
+    const off = tempo.anchor == null ? 1 : Math.abs(((beat - tempo.anchor) / period % 1 + 1.5) % 1 - 0.5);
+    if (off > 0.08) tempo.anchor = beat;
+  }
+  if (changed) saveTempo();
+}
+function listenStatus(){
+  if (listen.msg) return listen.msg;
+  if (listen.starting) return "Mic: starting…";
+  if (listen.quiet) return "Mic: too quiet, move closer";
+  if (listen.heard != null) return `Mic: hearing ${listen.heard.toFixed(1)} BPM` + (now() < listen.holdUntil ? " (held)" : "");
+  return "Mic: waiting for a steady beat";
+}
+function updateListen(){
+  const b = $("listen"), on = listen.on || listen.starting;
+  b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on));
+  b.textContent = on ? "Listening" : "Listen";
+  updateTempo();
+}
+$("listen").onclick = () => listen.on || listen.starting ? stopListening() : startListening();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && listen.ctx) listen.ctx.resume().catch(() => {}); });
+window.KS = Object.assign(window.KS || {}, {estimateTempo, analyseTempo, listen});   // for testing from the console
 
 /* ---------- Transport ---------- */
 $("play").onclick = () => clk.playing ? pause() : play();
@@ -564,6 +750,7 @@ document.addEventListener("keydown", e => {
   else if (e.key === "ArrowRight") seek(songTime() + 0.25);
   else if (e.key === "[") nudgeTempo(-1);
   else if (e.key === "]") nudgeTempo(1);
+  else if (e.key === "l" || e.key === "L") $("listen").click();
 });
 
 /* ---------- Loader modal (Bootstrap 4 markup, toggled without jQuery) ---------- */
