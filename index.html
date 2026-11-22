@@ -93,6 +93,8 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
 @keyframes pl{from{opacity:.95}to{opacity:0}}
 .meta{display:flex;justify-content:space-between;align-items:center;font-size:.78rem}
 .meta .links{display:flex;flex:none}
+.meta.follow{margin-top:4px}
+.meta.follow #followInfo{min-width:0;margin-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .meta .links .btn{margin-left:12px;font-size:.78rem}
 .meta .links .btn.on{color:var(--beat);font-weight:700}
 .meta .links .btn.on::before{content:"";display:inline-block;width:.5em;height:.5em;margin-right:4px;border-radius:50%;background:currentColor;vertical-align:.08em}
@@ -151,6 +153,7 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
       <button class="btn btn-outline-secondary btn-sm" id="faster" type="button" aria-label="Faster">+ BPM</button>
     </div>
     <div class="meta"><span class="text-muted" id="baseInfo">No base tempo yet</span><span class="links"><button class="btn btn-link btn-sm p-0" id="listen" type="button" aria-pressed="false" title="Find the tempo by listening through the microphone">Listen</button><button class="btn btn-link btn-sm p-0" id="typeBpm" type="button" aria-expanded="false" aria-controls="bpmForm">Type BPM</button><button class="btn btn-link btn-sm p-0" id="resetTempo" type="button">Reset tempo</button></span></div>
+    <div class="meta follow"><span class="text-muted" id="followInfo" role="status" aria-live="polite">Off: tap a word to sync by hand</span><span class="links"><button class="btn btn-link btn-sm p-0" id="follow" type="button" aria-pressed="false" title="Find the place in the lyrics by listening to the singing">Follow lyrics</button></span></div>
     <form class="bpmform" id="bpmForm" hidden novalidate>
       <div class="form-group"><label for="baseIn">Song BPM (1.00×)</label><input type="number" class="form-control form-control-sm" id="baseIn" inputmode="decimal" min="30" max="300" step="0.1" placeholder="e.g. 128"></div>
       <div class="form-group"><label for="curIn">Machine BPM now</label><input type="number" class="form-control form-control-sm" id="curIn" inputmode="decimal" min="30" max="300" step="0.1" placeholder="same as song"></div>
@@ -462,6 +465,7 @@ $("sheet").addEventListener("pointerup", e => {
   const d = down; down = null;
   if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || now() - d.at > 700) return;  // that was a scroll
   wordTapTempo(d.el._w.t0, d.at);
+  followTouched();
   seek(d.el._w.t0, d.at);          // timed from the finger-down moment
   play(); scrolledTo = null; userScrollUntil = 0;
   d.el.classList.add("tapped"); setTimeout(() => d.el.classList.remove("tapped"), 350);
@@ -643,43 +647,87 @@ class Onset extends AudioWorkletProcessor {
 }
 registerProcessor("onset", Onset);`;
 
+/* Shared microphone: tempo listening and lyric following each hold it open; it closes when neither does.
+   micOpen() must be called synchronously inside a tap, so phones let the audio context run. */
+const mic = {ctx:null, stream:null, src:null, sink:null, users:0, opening:null, mods:{}};
+function micUnsupported(){
+  const md = navigator.mediaDevices, AC = window.AudioContext || window.webkitAudioContext;
+  if (md && md.getUserMedia && AC && window.AudioWorkletNode) return "";
+  return window.isSecureContext === false ? "Listening needs the page on https" : "This browser can't listen";
+}
+function micOpen(){
+  mic.users++;
+  if (mic.opening) return mic.opening;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  mic.opening = (async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+      await ctx.resume();
+      const sink = ctx.createGain(); sink.gain.value = 0; sink.connect(ctx.destination);   // keeps nodes running; plays nothing
+      Object.assign(mic, {ctx, stream, sink, src: ctx.createMediaStreamSource(stream), mods:{}});
+      stream.getAudioTracks().forEach(t => t.addEventListener("ended", () => {
+        if (listen.on || listen.starting) listenFail("The microphone stopped");
+        if (follow.on || follow.starting) followFail("The microphone stopped");
+      }));
+      return mic;
+    } catch(e){
+      ctx.close().catch(() => {});
+      Object.assign(mic, {ctx:null, stream:null, src:null, sink:null, users:0, opening:null, mods:{}});
+      throw e;
+    }
+  })();
+  return mic.opening;
+}
+function micClose(){
+  if (--mic.users > 0) return;
+  if (mic.stream) mic.stream.getTracks().forEach(t => t.stop());
+  if (mic.ctx) mic.ctx.close().catch(() => {});
+  Object.assign(mic, {ctx:null, stream:null, src:null, sink:null, users:0, opening:null, mods:{}});
+}
+function micModule(name, code){
+  if (!mic.mods[name]){
+    const url = URL.createObjectURL(new Blob([code], {type:"application/javascript"}));
+    mic.mods[name] = mic.ctx.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+  }
+  return mic.mods[name];
+}
+const micError = (e, what) => e && e.name === "NotAllowedError" ? "Microphone access was blocked"
+                            : e && e.name === "NotFoundError" ? "No microphone found" : "Couldn't start " + what;
+
 const LISTEN_SECS = 8;
-const listen = {on:false, starting:false, ctx:null, stream:null, timer:null, fps:0, env:null, n:0, lastAt:0,
+const listen = {on:false, starting:false, gen:0, hasMic:false, node:null, timer:null, fps:0, env:null, n:0, lastAt:0,
                 peak:0, quiet:false, est:[], heard:null, holdUntil:0, msg:"", msgTimer:null};
 
 async function startListening(){
   if (listen.on || listen.starting) return;
-  const md = navigator.mediaDevices, AC = window.AudioContext || window.webkitAudioContext;
-  if (!md || !md.getUserMedia || !AC || !window.AudioWorkletNode)
-    return listenFail(window.isSecureContext === false ? "Listening needs the page on https" : "This browser can't listen");
-  listen.starting = true; listen.msg = ""; updateListen();
-  const ctx = new AC();                     // created inside the tap, so phones let it run
+  const no = micUnsupported(); if (no) return listenFail(no);
+  listen.starting = true; listen.msg = ""; listen.hasMic = true; updateListen();
+  const gen = ++listen.gen;
   try {
-    const stream = await md.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
-    const url = URL.createObjectURL(new Blob([ONSET_WORKLET], {type:"application/javascript"}));
-    try { await ctx.audioWorklet.addModule(url); } finally { URL.revokeObjectURL(url); }
-    const node = new AudioWorkletNode(ctx, "onset");
-    const mute = ctx.createGain(); mute.gain.value = 0;        // keeps the node running; plays nothing
-    ctx.createMediaStreamSource(stream).connect(node); node.connect(mute); mute.connect(ctx.destination);
+    const m = await micOpen();
+    await micModule("onset", ONSET_WORKLET);
+    if (gen !== listen.gen) return;                       // stopped while starting
+    const node = new AudioWorkletNode(m.ctx, "onset");
+    m.src.connect(node); node.connect(m.sink);
     node.port.onmessage = e => onOnsets(e.data);
-    await ctx.resume();
-    listen.fps = ctx.sampleRate / 256;
+    listen.fps = m.ctx.sampleRate / 256;
     listen.env = new Float32Array(Math.ceil(listen.fps * LISTEN_SECS));
-    Object.assign(listen, {on:true, starting:false, ctx, stream, n:0, est:[], heard:null, quiet:false, peak:0});
-    stream.getAudioTracks().forEach(t => t.addEventListener("ended", () => listenFail("The microphone stopped")));
+    Object.assign(listen, {on:true, starting:false, node, n:0, est:[], heard:null, quiet:false, peak:0});
     listen.timer = setInterval(analyseTempo, 1000);
     wake(); updateListen();
   } catch(e){
-    ctx.close().catch(() => {});
-    listen.starting = false;
-    listenFail(e && e.name === "NotAllowedError" ? "Microphone access was blocked" : e && e.name === "NotFoundError" ? "No microphone found" : "Couldn't start listening");
+    if (gen !== listen.gen) return;
+    if (mic.users > 0) micClose();                        // the mic opened but the rest failed (a failed open already let go)
+    listen.hasMic = false; listen.starting = false;
+    listenFail(micError(e, "listening"));
   }
 }
 function stopListening(){
+  listen.gen++;
   clearInterval(listen.timer);
-  if (listen.stream) listen.stream.getTracks().forEach(t => t.stop());
-  if (listen.ctx) listen.ctx.close().catch(() => {});
-  Object.assign(listen, {on:false, starting:false, ctx:null, stream:null, timer:null, heard:null, est:[]});
+  if (listen.node){ try { listen.node.disconnect(); mic.src && mic.src.disconnect(listen.node); } catch(e){} }
+  if (listen.hasMic) micClose();
+  Object.assign(listen, {on:false, starting:false, hasMic:false, node:null, timer:null, heard:null, est:[]});
   updateListen();
 }
 function listenFail(msg){
@@ -781,7 +829,262 @@ function updateListen(){
 }
 $("listen").onclick = () => listen.on || listen.starting ? stopListening() : startListening();
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && listen.ctx) listen.ctx.resume().catch(() => {}); });
-window.KS = Object.assign(window.KS || {}, {estimateTempo, analyseTempo, listen});   // for testing from the console
+/* ---------- Follow lyrics: hear the singing, find the place in the lyrics ----------
+   The mic's last 8 s go to /api/transcribe (a Vercel function that calls Whisper) every 5 s while
+   looking for the place and every 10 s once following. The words heard, with their times, are
+   matched against the lyrics by sound (kana → romaji, spelling variants folded), and the clock is
+   moved to the matched place. Only works where /api/transcribe exists (the Vercel deployment). */
+const PCM_WORKLET = `
+class Pcm extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Float32Array(4096); this.n = 0; }
+  process(inputs){
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++){
+      this.buf[this.n++] = ch[i];
+      if (this.n === this.buf.length){ this.port.postMessage(this.buf, [this.buf.buffer]); this.buf = new Float32Array(4096); this.n = 0; }
+    }
+    return true;
+  }
+}
+registerProcessor("pcm", Pcm);`;
+
+const FOLLOW_WIN = 8, FOLLOW_KEEP = 12, FOLLOW_SEEK = 5000, FOLLOW_TRACK = 10000;
+const follow = {on:false, starting:false, gen:0, hasMic:false, node:null, sr:0, ring:null, n:0, lastAt:0,
+                timer:null, busy:false, nextAt:0, lockedAt:0, holdUntil:0, pending:null, state:"", msg:"", msgTimer:null};
+
+async function startFollow(){
+  if (follow.on || follow.starting) return;
+  const no = micUnsupported(); if (no) return followFail(no);
+  if (location.protocol === "file:") return followFail("Follow lyrics needs the Vercel version of this page");
+  follow.starting = true; follow.msg = ""; follow.hasMic = true; updateFollow();
+  const gen = ++follow.gen;
+  try {
+    const m = await micOpen();
+    await micModule("pcm", PCM_WORKLET);
+    if (gen !== follow.gen) return;
+    const node = new AudioWorkletNode(m.ctx, "pcm");
+    m.src.connect(node); node.connect(m.sink);
+    node.port.onmessage = e => onPcm(e.data);
+    follow.sr = m.ctx.sampleRate;
+    follow.ring = new Float32Array(Math.ceil(follow.sr * FOLLOW_KEEP));
+    Object.assign(follow, {on:true, starting:false, node, n:0, busy:false, nextAt:0, pending:null, state:"Listening for singing…"});
+    follow.timer = setInterval(followTick, 500);
+    wake(); updateFollow();
+  } catch(e){
+    if (gen !== follow.gen) return;
+    if (mic.users > 0) micClose();
+    follow.hasMic = false; follow.starting = false;
+    followFail(micError(e, "following"));
+  }
+}
+function stopFollow(){
+  follow.gen++;
+  clearInterval(follow.timer);
+  if (follow.node){ try { follow.node.disconnect(); mic.src && mic.src.disconnect(follow.node); } catch(e){} }
+  if (follow.hasMic) micClose();
+  Object.assign(follow, {on:false, starting:false, hasMic:false, node:null, timer:null, ring:null, busy:false, pending:null});
+  updateFollow();
+}
+function followFail(msg){
+  stopFollow();
+  follow.msg = msg; updateFollow();
+  clearTimeout(follow.msgTimer); follow.msgTimer = setTimeout(() => { follow.msg = ""; updateFollow(); }, 8000);
+}
+/* A word tap is a sync the user made: trust it, and don't second-guess it for a few seconds. */
+function followTouched(){ follow.holdUntil = now() + 6000; follow.lockedAt = now(); follow.pending = null; }
+
+function onPcm(buf){
+  const r = follow.ring; if (!r) return;
+  for (let i = 0; i < buf.length; i++) r[(follow.n + i) % r.length] = buf[i];
+  follow.n += buf.length; follow.lastAt = now();
+}
+
+/* The last `secs` of audio as a 16 kHz mono 16-bit WAV (box-filtered down from the mic's rate). */
+function clipWav(secs){
+  const r = follow.ring, sr = follow.sr, len = Math.min(follow.n, Math.round(secs * sr), r.length), start = follow.n - len;
+  const ratio = sr / 16000, out = Math.floor(len / ratio), pcm = new Int16Array(out);
+  let sum2 = 0;
+  for (let i = 0; i < out; i++){
+    const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.floor((i + 1) * ratio));
+    let s = 0; for (let j = a; j < b; j++) s += r[(start + j) % r.length];
+    s /= b - a; sum2 += s * s;
+    pcm[i] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
+  }
+  const wav = new DataView(new ArrayBuffer(44 + pcm.byteLength));
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) wav.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); wav.setUint32(4, 36 + pcm.byteLength, true); str(8, "WAVE"); str(12, "fmt ");
+  wav.setUint32(16, 16, true); wav.setUint16(20, 1, true); wav.setUint16(22, 1, true);
+  wav.setUint32(24, 16000, true); wav.setUint32(28, 32000, true); wav.setUint16(32, 2, true); wav.setUint16(34, 16, true);
+  str(36, "data"); wav.setUint32(40, pcm.byteLength, true);
+  new Int16Array(wav.buffer, 44).set(pcm);
+  return {blob: new Blob([wav.buffer], {type:"audio/wav"}), secs: len / sr, rms: Math.sqrt(sum2 / (out || 1))};
+}
+
+/* Lyrics near where we expect to be, to nudge Whisper toward the right words and spelling. */
+function followPrompt(){
+  const lines = song.lines, locked = now() - follow.lockedAt < 30000;
+  const t = songTime(), text = l => l.sylls.map(s => s.text).join("").trim();
+  const pick = locked ? lines.filter(l => l.end >= t - 4 && l.start <= t + 14) : lines.slice(0, 6);
+  return pick.map(text).join(" ").slice(0, 450);
+}
+
+async function followTick(){
+  if (!follow.on || follow.busy || !song || now() < follow.nextAt) return;
+  if (follow.n < follow.sr * FOLLOW_WIN * 0.75) return;
+  const clip = clipWav(FOLLOW_WIN), endAt = follow.lastAt, sentAt = now();
+  if (clip.rms < 0.002){ follow.state = "Too quiet, move closer"; follow.nextAt = sentAt + 2000; return updateFollow(); }
+  follow.busy = true;
+  const gen = follow.gen;
+  try {
+    const res = await fetch("api/transcribe?prompt=" + encodeURIComponent(followPrompt()), {method:"POST", headers:{"Content-Type":"audio/wav"}, body:clip.blob});
+    if (gen !== follow.gen) return;
+    if (res.status === 404 || res.status === 405) return followFail("Follow lyrics needs the Vercel version of this page");
+    let data = null; try { data = await res.json(); } catch(e){}
+    if (res.status === 503) return followFail((data && data.error) || "Lyric listening isn't set up");
+    if (res.status === 429){
+      follow.state = "Transcriber busy, waiting…";
+      follow.nextAt = sentAt + Math.max(10, +res.headers.get("retry-after") || 0) * 1000;
+      return;
+    }
+    if (!res.ok || !data) throw new Error((data && data.error) || "HTTP " + res.status);
+    const locked = now() - follow.lockedAt < 30000;
+    follow.nextAt = sentAt + (locked ? FOLLOW_TRACK : FOLLOW_SEEK);
+    followUse(matchLyrics(data.words || [], endAt - clip.secs * 1000, endAt, locked ? songTime() : null), data);
+  } catch(e){
+    if (gen !== follow.gen) return;
+    follow.state = "Couldn't reach the transcriber, retrying";
+    follow.nextAt = sentAt + FOLLOW_SEEK;
+  } finally {
+    if (gen === follow.gen){ follow.busy = false; updateFollow(); }
+  }
+}
+
+function followUse(m, data){
+  if (!m){
+    follow.pending = null;
+    follow.state = data && data.text && data.text.trim() ? "Heard singing, couldn't place it" : "Listening for singing…";
+    return;
+  }
+  const locked = now() - follow.lockedAt < 30000;
+  if (!locked){
+    // not following yet: wait for two hearings that agree, so one lucky match can't jump us somewhere wrong
+    const p = follow.pending, agree = p && Math.abs((p.song + (m.at - p.at) / 1000 * clk.rate) - m.song) < 1.5;
+    if (!agree){ follow.pending = m; follow.state = "Found a match, checking…"; return; }
+  }
+  follow.pending = null; follow.lockedAt = now();
+  const target = m.song + (now() - m.at) / 1000 * clk.rate;
+  const off = target - songTime();
+  if (!clk.playing){ seek(target); play(); scrolledTo = null; userScrollUntil = 0; }
+  else if (Math.abs(off) > 0.35 && now() >= follow.holdUntil) seek(target);
+  follow.state = `Following · was ${Math.abs(off) < 0.35 ? "in time" : (off > 0 ? "behind " : "ahead ") + Math.abs(off).toFixed(1) + " s"}`;
+}
+
+/* --- Sound-alike text: kana → romaji, then fold spellings that sound the same --- */
+const KANA = (() => {
+  const m = {}, src = "あa いi うu えe おo かka きki くku けke こko さsa しshi すsu せse そso たta ちchi つtsu てte とto なna にni ぬnu ねne のno はha ひhi ふfu へhe ほho まma みmi むmu めme もmo やya ゆyu よyo らra りri るru れre ろro わwa をwo んn がga ぎgi ぐgu げge ごgo ざza じji ずzu ぜze ぞzo だda ぢji づzu でde どdo ばba びbi ぶbu べbe ぼbo ぱpa ぴpi ぷpu ぺpe ぽpo ぁa ぃi ぅu ぇe ぉo ゃya ゅyu ょyo ゔvu ゐi ゑe";
+  for (const p of src.split(" ")) m[p[0]] = p.slice(1);
+  return m;
+})();
+function kanaToRomaji(s){
+  let out = "";
+  const ch = [...s].map(c => { const k = c.charCodeAt(0); return k >= 0x30A1 && k <= 0x30F6 ? String.fromCharCode(k - 0x60) : c; });
+  for (let i = 0; i < ch.length; i++){
+    const c = ch[i], nx = ch[i + 1];
+    if (c === "っ"){ const r = KANA[nx]; out += r ? r[0] : ""; continue; }
+    if (c === "ー") continue;
+    let r = KANA[c];
+    if (r === undefined){ out += c; continue; }
+    if (nx && "ゃゅょ".includes(nx) && r.length > 1 && r.endsWith("i")){
+      const base = r.slice(0, -1), v = KANA[nx].slice(1);
+      r = /^(sh|ch|j)$/.test(base) ? base + v : base + "y" + v; i++;
+    } else if (nx && "ぁぃぅぇぉ".includes(nx) && r.length > 1){ r = r.slice(0, -1) + KANA[nx]; i++; }
+    out += r;
+  }
+  return out;
+}
+function soundKey(s){
+  return kanaToRomaji(s.normalize("NFKC").toLowerCase()).replace(/[^a-z]/g, "")
+    .replace(/shi/g, "si").replace(/chi/g, "ti").replace(/tsu/g, "tu").replace(/fu/g, "hu").replace(/ji/g, "zi")
+    .replace(/sh/g, "sy").replace(/ch/g, "ty").replace(/j/g, "zy").replace(/l/g, "r").replace(/v/g, "b").replace(/wo/g, "o")
+    .replace(/ou/g, "o").replace(/uu/g, "u").replace(/oo/g, "o").replace(/(.)\1+/g, "$1");
+}
+let lyrIdx = null;
+function lyricIndex(){
+  if (lyrIdx && lyrIdx.song === song) return lyrIdx;
+  let s = ""; const wi = [], wStart = [];
+  words.forEach((w, i) => { const k = soundKey(w.el.textContent); wStart.push(s.length); s += k; for (let j = 0; j < k.length; j++) wi.push(i); });
+  return lyrIdx = {song, s, wi, wStart, t0: words.map(w => w.t0)};
+}
+
+/* Local alignment (Smith–Waterman) of what was heard against a stretch of the lyrics.
+   Returns {score, matches:[[heardPos, lyricPos], …]}. */
+function alignText(T, L, l0, l1){
+  const n = T.length, m = l1 - l0;
+  if (!n || m <= 0) return null;
+  const dir = new Uint8Array((n + 1) * (m + 1));
+  let prev = new Int32Array(m + 1), cur = new Int32Array(m + 1), best = 0, bi = 0, bj = 0;
+  for (let i = 1; i <= n; i++){
+    cur[0] = 0;
+    for (let j = 1; j <= m; j++){
+      const d = prev[j-1] + (T[i-1] === L[l0 + j - 1] ? 2 : -1), u = prev[j] - 1, l = cur[j-1] - 1;
+      let v = 0, k = 0;
+      if (d > v){ v = d; k = 1; } if (u > v){ v = u; k = 2; } if (l > v){ v = l; k = 3; }
+      cur[j] = v; dir[i * (m + 1) + j] = k;
+      if (v > best){ best = v; bi = i; bj = j; }
+    }
+    [prev, cur] = [cur, prev];
+  }
+  const matches = [];
+  let i = bi, j = bj;
+  while (i > 0 && j > 0){
+    const k = dir[i * (m + 1) + j];
+    if (k === 0) break;
+    if (k === 1){ if (T[i-1] === L[l0 + j - 1]) matches.push([i - 1, l0 + j - 1]); i--; j--; }
+    else if (k === 2) i--; else j--;
+  }
+  return {score: best, matches: matches.reverse()};
+}
+
+/* Words heard (times in s from clipStart; clipStart/clipEnd are performance.now() times) → {song, at}:
+   the song time at moment `at` (the clip's end), or null. With `near` set, only lyrics within 25 s
+   of that song time are searched. */
+function matchLyrics(heard, clipStart, clipEnd, near){
+  const idx = lyricIndex(); if (!idx.s.length) return null;
+  let T = ""; const tw = [], tStart = [];
+  heard.forEach((w, i) => { const k = soundKey(w.word); tStart.push(T.length); T += k; for (let j = 0; j < k.length; j++) tw.push(i); });
+  if (T.length < 8) return null;
+  let l0 = 0, l1 = idx.s.length;
+  if (near != null){
+    const a = idx.t0.findIndex(t => t >= near - 25), b = idx.t0.findIndex(t => t > near + 25);
+    l0 = a < 0 ? idx.s.length : idx.wStart[a]; l1 = b < 0 ? idx.s.length : idx.wStart[b];
+  }
+  const al = alignText(T, idx.s, l0, l1);
+  if (!al || al.matches.length < 8 || al.score < Math.max(12, T.length * 0.9)) return null;
+  // each heard word whose first sound lines up with the start of a lyric word gives a (time heard, song time) pair
+  const est = [];
+  for (const [ti, li] of al.matches){
+    const w = tw[ti], lw = idx.wi[li];
+    if (ti - tStart[w] > 1 || li - idx.wStart[lw] > 1) continue;
+    if (est.length && est[est.length - 1].w === w) continue;
+    const at = clipStart + heard[w].start * 1000;
+    est.push({w, song: idx.t0[lw] + (clipEnd - at) / 1000 * clk.rate});
+  }
+  if (est.length < 2) return null;
+  const v = est.map(e => e.song).sort((a, b) => a - b), med = v[v.length >> 1];
+  if (v.filter(x => Math.abs(x - med) < 1).length < Math.max(2, v.length * 0.6)) return null;    // pairs disagree
+  return {song: med, at: clipEnd, score: al.score, pairs: v.length};
+}
+
+function updateFollow(){
+  const b = $("follow"), on = follow.on || follow.starting;
+  b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on));
+  b.textContent = on ? "Following lyrics" : "Follow lyrics";
+  $("followInfo").textContent = follow.msg || (follow.starting ? "Starting the microphone…" : follow.on ? follow.state : "Off: tap a word to sync by hand");
+}
+$("follow").onclick = () => follow.on || follow.starting ? stopFollow() : startFollow();
+
+window.KS = Object.assign(window.KS || {}, {estimateTempo, analyseTempo, listen, follow, matchLyrics, soundKey, kanaToRomaji, lyricIndex});   // for testing from the console
 
 /* ---------- Transport ---------- */
 $("play").onclick = () => clk.playing ? pause() : play();

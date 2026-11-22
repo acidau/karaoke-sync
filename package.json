@@ -2,6 +2,7 @@
   "name": "karaoke-sync",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Follow-along karaoke lyrics from kara.moe with live syllable highlighting, tap-to-sync and tap-tempo speed control.",
   "scripts": {
     "build": "node build.mjs"
