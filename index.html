@@ -477,7 +477,7 @@ const tempo = {base:null, taps:[], baseSeries:false, anchor:null, lastBeat:null,
    Tapping the same word again replaces that tap (a correction); tapping an earlier word starts over. */
 function wordTapTempo(songT, at){
   const w = tempo.words, last = w[w.length - 1];
-  if (last && (at - last.at > 60000 || songT < last.song - 0.01)) w.length = 0;      // long pause or went back
+  if (last && (at - last.at > 60000 || songT < last.song - 0.01)){ w.length = 0; tempo.note = ""; updateTempo(); }   // long pause or went back
   else if (last && Math.abs(songT - last.song) < 0.01) w.pop();                      // same word again
   w.push({song: songT, at}); if (w.length > 3) w.shift();
   if (w.length < 2) return;
@@ -493,7 +493,7 @@ function wordTapTempo(songT, at){
   tempo.note = `From your last ${n} taps: ${r.toFixed(2)}×`; tempo.noteUntil = now() + 4000;
   updateTempo(); setTimeout(updateTempo, 4100);
 }
-function tempoTouched(){ listenHold(); tempo.words = []; }
+function tempoTouched(){ listenHold(); tempo.words = []; tempo.note = ""; }
 function onBeatTap(){
   const at = now();
   tempoTouched();
