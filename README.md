@@ -24,6 +24,7 @@ Open `index.html` in a browser, or host it on any static host (e.g. GitHub Pages
 | `index.html` | The page and its source. Edit this. Bootstrap 4.6.2 CSS is inlined, so it works on GitHub Pages without a build step. |
 | `build.mjs` | Copies the `<body>` of `index.html` to `build/artifact.html`. |
 | `build/artifact.html` | Body-only page for publishing as a Claude artifact (not committed). |
+| `vercel.json` | Vercel settings: copies `index.html` into `dist/` and serves that. GitHub Pages ignores it. |
 
 ## Building
 
