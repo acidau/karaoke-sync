@@ -108,6 +108,21 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
 .credit a:hover{color:var(--fg)}
 .bpmform .err{flex-basis:100%;margin:0 4px 6px;font-size:.78rem;color:#dc3545}
 .custom-file.drop .custom-file-label{border:2px dashed var(--beat)}
+/* song library (loader modal) */
+.lib-list{border:1px solid var(--line);border-radius:.25rem;background:var(--bg);max-height:42vh;overflow-y:auto;overscroll-behavior:contain}
+.lib-head{padding:.4rem .75rem .2rem;font-size:.7rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.lib-row{display:flex;align-items:stretch;border-top:1px solid var(--line)}
+.lib-head + .lib-row,.lib-list > .lib-row:first-child{border-top:0}
+.lib-row.cur{box-shadow:inset 3px 0 var(--sung)}
+.lib-open{flex:1;min-width:0;text-align:left;background:none;border:0;color:var(--fg);padding:.5rem .75rem;line-height:1.3}
+.lib-open:hover,.lib-pin:hover,button.lib-del:hover{background:var(--raised)}
+.lib-open b,.lib-open small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lib-open b{font-weight:600}
+.lib-open small{color:var(--muted)}
+.lib-pin,.lib-del{flex:none;width:44px;background:none;border:0;color:var(--muted);display:flex;align-items:center;justify-content:center}
+.lib-pin svg{width:16px;height:16px;fill:currentColor}
+.lib-pin[aria-pressed="true"]{color:var(--sung)}
+.lib-del{font-size:1.3rem;line-height:1}
 .alert{margin-bottom:0}
 @media (prefers-reduced-motion: reduce){.pulse.on{animation:none;opacity:.6}.ln{transition:none}}
 </style>
@@ -155,6 +170,12 @@ main{overflow-y:auto;overscroll-behavior:contain;position:relative}
         <button type="button" class="close" id="closeX" aria-label="Close"><span aria-hidden="true">&times;</span></button>
       </div>
       <div class="modal-body">
+        <div id="lib" hidden>
+          <label class="d-block" id="libLabel">Your songs</label>
+          <div class="lib-list" id="libList" role="list" aria-labelledby="libLabel"></div>
+          <small class="form-text text-muted">Saved on this device. Pin a song to keep it on top.</small>
+          <hr>
+        </div>
         <div class="form-group">
           <label for="url">Song page link</label>
           <div class="input-group">
@@ -440,6 +461,7 @@ $("sheet").addEventListener("pointerup", e => {
   if (!down || e.pointerId !== down.id) return;
   const d = down; down = null;
   if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 12 || now() - d.at > 700) return;  // that was a scroll
+  wordTapTempo(d.el._w.t0, d.at);
   seek(d.el._w.t0, d.at);          // timed from the finger-down moment
   play(); scrolledTo = null; userScrollUntil = 0;
   d.el.classList.add("tapped"); setTimeout(() => d.el.classList.remove("tapped"), 350);
@@ -448,10 +470,33 @@ $("sheet").addEventListener("pointerup", e => {
 $("sheet").addEventListener("pointercancel", () => down = null);
 
 /* ---------- Tap tempo ---------- */
-const tempo = {base:null, taps:[], baseSeries:false, anchor:null, lastBeat:null};
+const tempo = {base:null, taps:[], baseSeries:false, anchor:null, lastBeat:null, words:[], note:"", noteUntil:0};
+
+/* Tempo from word taps: each tap on a later word pairs a song time with the moment it was tapped.
+   The slope of song time against real time over the last 3 taps is the machine's speed.
+   Tapping the same word again replaces that tap (a correction); tapping an earlier word starts over. */
+function wordTapTempo(songT, at){
+  const w = tempo.words, last = w[w.length - 1];
+  if (last && (at - last.at > 60000 || songT < last.song - 0.01)) w.length = 0;      // long pause or went back
+  else if (last && Math.abs(songT - last.song) < 0.01) w.pop();                      // same word again
+  w.push({song: songT, at}); if (w.length > 3) w.shift();
+  if (w.length < 2) return;
+  const n = w.length, xs = w.map(p => p.at / 1000), ys = w.map(p => p.song);
+  const mx = xs.reduce((a, b) => a + b) / n, my = ys.reduce((a, b) => a + b) / n;
+  let sxy = 0, sxx = 0;
+  for (let i = 0; i < n; i++){ sxy += (xs[i] - mx) * (ys[i] - my); sxx += (xs[i] - mx) ** 2; }
+  if (xs[n-1] - xs[0] < 1.5 || ys[n-1] - ys[0] < 1) return;       // too close together to judge
+  const r = sxy / sxx;
+  if (!(r >= 0.5 && r <= 1.5)){ w.splice(0, n - 1); return; }      // not a plausible speed: start again from this tap
+  listenHold();
+  if (Math.abs(r / clk.rate - 1) > 0.005){ setRate(r); saveTempo(); }
+  tempo.note = `From your last ${n} taps: ${r.toFixed(2)}×`; tempo.noteUntil = now() + 4000;
+  updateTempo(); setTimeout(updateTempo, 4100);
+}
+function tempoTouched(){ listenHold(); tempo.words = []; }
 function onBeatTap(){
   const at = now();
-  listenHold();
+  tempoTouched();
   if (tempo.taps.length && at - tempo.taps[tempo.taps.length-1] > 2000) tempo.taps = [];
   if (!tempo.taps.length) tempo.baseSeries = tempo.base == null;
   tempo.taps.push(at); if (tempo.taps.length > 9) tempo.taps.shift();
@@ -466,7 +511,7 @@ function onBeatTap(){
   } else updateTempo();
 }
 function nudgeTempo(dir){
-  listenHold();
+  tempoTouched();
   if (tempo.base){ const b = Math.round(tempo.base * clk.rate) + dir; setRate(Math.min(1.5, Math.max(0.5, b / tempo.base))); }
   else setRate(Math.round((clk.rate + dir*0.01)*100)/100);
   saveTempo();
@@ -492,7 +537,7 @@ function saveTempo(){
 }
 function loadTempo(){
   const e = readTempoMap()[songKey(song)];
-  tempo.taps = []; tempo.anchor = null; tempo.lastBeat = null; tempo.baseSeries = false;
+  tempo.taps = []; tempo.anchor = null; tempo.lastBeat = null; tempo.baseSeries = false; tempo.words = [];
   tempo.base = e && e.base > 0 ? e.base : null;
   clk.rate = e && e.rate >= 0.5 && e.rate <= 1.5 ? e.rate : 1;
   if (tempo.base) tempo.anchor = 0;
@@ -521,7 +566,7 @@ $("bpmForm").addEventListener("submit", e => {
   if (!(base >= 30 && base <= 300) || !(cur >= 30 && cur <= 300)) return err("BPM must be between 30 and 300.");
   const r = cur / base;
   if (r < 0.5 || r > 1.5) return err("Machine BPM must be within half to one and a half times the song BPM.");
-  listenHold();
+  tempoTouched();
   tempo.base = base; tempo.taps = []; tempo.baseSeries = false;
   if (tempo.anchor == null) tempo.anchor = songTime();
   setRate(r); saveTempo(); openBpmForm(false);
@@ -541,6 +586,7 @@ function updateTempo(){
     $("baseInfo").textContent = "No base tempo yet";
   }
   if (listen.on || listen.starting || listen.msg) $("padHelp").textContent = listenStatus();
+  if (tempo.note && now() < tempo.noteUntil) $("padHelp").textContent = tempo.note;
 }
 function beatFrame(t){
   if (!tempo.base || tempo.anchor == null) return;
@@ -555,7 +601,7 @@ $("pad").addEventListener("pointerdown", e => { e.preventDefault(); onBeatTap();
 $("pad").addEventListener("keydown", e => { if (e.key === "Enter"){ e.preventDefault(); onBeatTap(); } });
 $("slower").onclick = () => nudgeTempo(-1);
 $("faster").onclick = () => nudgeTempo(1);
-$("resetTempo").onclick = () => { listenHold(); tempo.base = null; tempo.taps = []; tempo.anchor = null; setRate(1); saveTempo(); openBpmForm(false); };
+$("resetTempo").onclick = () => { tempoTouched(); tempo.base = null; tempo.taps = []; tempo.anchor = null; setRate(1); saveTempo(); openBpmForm(false); };
 
 /* ---------- Listen: tempo from the microphone ----------
    An AudioWorklet turns mic audio into an onset signal: the rise in loudness in three bands
@@ -757,7 +803,7 @@ document.addEventListener("keydown", e => {
 let loaderOpen = false;
 function openLoader(){
   const m = $("loader"), b = $("backdrop");
-  loaderOpen = true; $("status").hidden = true;
+  loaderOpen = true; $("status").hidden = true; renderLib();
   document.body.classList.add("modal-open");
   b.hidden = false; m.style.display = "block"; m.removeAttribute("aria-hidden"); m.setAttribute("aria-modal","true");
   void m.offsetWidth; b.classList.add("show"); m.classList.add("show");
@@ -776,8 +822,93 @@ $("loader").addEventListener("click", e => { if (e.target === $("loader")) close
 
 function setSong(s, keep = true){
   song = s; render(); loadTempo();
-  if (keep && !s.demo) store.set("ks.song", JSON.stringify(s));
+  if (keep && !s.demo){ store.set("ks.song", JSON.stringify(s)); addToLib(s); }
 }
+
+/* ---------- Song library: songs loaded before, kept in localStorage ("ks.library") ----------
+   Pinned songs stay on top (A–Z) and are never dropped; the rest are newest first, up to LIB_RECENT. */
+const LIB_KEY = "ks.library", LIB_RECENT = 30;
+const PIN_SVG = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 1h7l-1.2 4.6L13 9H8.7v6h-1.4V9H3l2.7-3.4z"/></svg>';
+function readLib(){
+  try { const a = JSON.parse(store.get(LIB_KEY) || "[]"); return Array.isArray(a) ? a.filter(e => e && e.key && e.song && Array.isArray(e.song.lines) && e.song.lines.length) : []; }
+  catch(e){ return []; }
+}
+function sortLib(lib){
+  const name = e => (e.title || "").toLowerCase();
+  return lib.slice().sort((a, b) => (b.pinned - a.pinned) || (a.pinned ? name(a).localeCompare(name(b)) : b.at - a.at));
+}
+function writeLib(lib){
+  const s = sortLib(lib), keep = s.filter(e => e.pinned).concat(s.filter(e => !e.pinned).slice(0, LIB_RECENT));
+  for (;;){
+    try { localStorage.setItem(LIB_KEY, JSON.stringify(keep)); return true; }
+    catch(e){
+      const full = e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED" || e.code === 22);
+      let i = -1; keep.forEach((x, j) => { if (!x.pinned) i = j; });      // oldest unpinned song
+      if (!full || i < 0) return false;
+      keep.splice(i, 1);
+    }
+  }
+}
+function compactSong(s){
+  const r = x => Math.round(x * 1000) / 1000;
+  return {title: s.title || "", artist: s.artist || "", id: s.id,
+          lines: s.lines.map(l => ({start: r(l.start), end: r(l.end), sylls: l.sylls.map(y => ({t0: r(y.t0), t1: r(y.t1), text: y.text}))}))};
+}
+function addToLib(s){
+  const key = songKey(s); if (!key || s.demo) return;
+  const lib = readLib(), old = lib.find(e => e.key === key);
+  const entry = {key, title: s.title || "", artist: s.artist || "", pinned: !!(old && old.pinned), at: Date.now(), song: compactSong(s)};
+  writeLib(lib.filter(e => e.key !== key).concat(entry));
+}
+function renderLib(focusKey, focusPart){
+  const lib = sortLib(readLib()), list = $("libList"), cur = songKey(song);
+  $("lib").hidden = !lib.length; list.textContent = "";
+  const both = lib.some(e => e.pinned) && lib.some(e => !e.pinned);
+  let group = null;
+  for (const e of lib){
+    if (both && e.pinned !== group){
+      group = e.pinned;
+      const h = document.createElement("div"); h.className = "lib-head"; h.setAttribute("role", "presentation");
+      h.textContent = e.pinned ? "Pinned" : "Recent"; list.append(h);
+    }
+    const row = document.createElement("div"); row.className = "lib-row" + (e.key === cur ? " cur" : ""); row.setAttribute("role", "listitem");
+    row.dataset.key = e.key;
+    const open = document.createElement("button"); open.type = "button"; open.className = "lib-open"; open.dataset.act = "open";
+    const b = document.createElement("b"); b.textContent = e.title || "Untitled song";
+    const sm = document.createElement("small"); sm.textContent = (e.artist ? e.artist + " · " : "") + (e.key === cur ? "loaded now" : agoText(e.at));
+    open.append(b, sm);
+    const pin = document.createElement("button"); pin.type = "button"; pin.className = "lib-pin"; pin.dataset.act = "pin";
+    pin.innerHTML = PIN_SVG; pin.setAttribute("aria-pressed", String(!!e.pinned));
+    pin.setAttribute("aria-label", (e.pinned ? "Unpin " : "Pin ") + (e.title || "song")); pin.title = e.pinned ? "Unpin" : "Pin to top";
+    row.append(open, pin);
+    if (!e.pinned){                                   // unpin first to remove a pinned song
+      const del = document.createElement("button"); del.type = "button"; del.className = "lib-del"; del.dataset.act = "del";
+      del.innerHTML = "&times;"; del.setAttribute("aria-label", "Remove " + (e.title || "song")); del.title = "Remove from this list";
+      row.append(del);
+    } else { const sp = document.createElement("span"); sp.className = "lib-del"; sp.setAttribute("aria-hidden", "true"); row.append(sp); }
+    list.append(row);
+  }
+  if (focusKey){
+    const row = [...list.children].find(r => r.dataset && r.dataset.key === focusKey);
+    const btn = row && (row.querySelector(`[data-act="${focusPart}"]`) || row.querySelector(".lib-open"));
+    if (btn) btn.focus();
+  }
+}
+function agoText(at){
+  const m = Math.round((Date.now() - (at || 0)) / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return m + " min ago";
+  const h = Math.round(m / 60); if (h < 24) return h + " h ago";
+  const d = Math.round(h / 24); return d < 14 ? d + (d === 1 ? " day ago" : " days ago") : new Date(at).toLocaleDateString();
+}
+$("libList").addEventListener("click", e => {
+  const btn = e.target.closest("button[data-act]"); if (!btn) return;
+  const key = btn.closest(".lib-row").dataset.key, lib = readLib(), entry = lib.find(x => x.key === key);
+  if (!entry) return renderLib();
+  if (btn.dataset.act === "open"){ setSong(entry.song); closeLoader(); }
+  else if (btn.dataset.act === "pin"){ entry.pinned = !entry.pinned; writeLib(lib); renderLib(key, "pin"); }
+  else if (btn.dataset.act === "del"){ writeLib(lib.filter(x => x.key !== key)); renderLib(); }
+});
 function status(html, err){ const el = $("status"); el.hidden = false; el.className = "alert " + (err ? "alert-danger" : "alert-info"); el.innerHTML = html; }
 $("demo").onclick = () => { setSong(demoSong(), false); closeLoader(); };
 const esc = s => s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -837,6 +968,7 @@ drop.addEventListener("drop", async e => { e.preventDefault(); drop.classList.re
 let saved = null;
 try { saved = JSON.parse(store.get("ks.song") || "null"); } catch(e){}
 setSong(saved && saved.lines && saved.lines.length ? saved : demoSong(), false);
+if (song && !song.demo && !readLib().length) addToLib(song);      // first run with the library: keep the last song
 updatePlay();
 requestAnimationFrame(frame);
 })();

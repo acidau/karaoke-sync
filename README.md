@@ -5,6 +5,7 @@ Follow-along karaoke lyrics for your phone. Load a song from [kara.moe](https://
 ## Features
 
 - **Load songs from kara.moe** by pasting a song page link, choosing the `.ass` lyrics file, or pasting the song data.
+- **Your songs.** Every song you load is saved on this device and listed at the top of **Load song**, newest first, so you can reopen it without the link or file. Pin a song to keep it at the top (pinned songs are A–Z and never dropped). Up to 30 unpinned songs are kept; when the browser's storage is full, the oldest unpinned songs go first. Remove a song with ×; unpin it first if it's pinned.
 - **Tap a word to sync.** Highlighting jumps to that word and carries on, with auto-scroll and lead-in dots before each line.
 - **Tap tempo.** Tap the beat 4+ times to set the base tempo, then tap again during the song to speed up or slow down to match the machine.
 - **Listen for the tempo.** Tap **Listen** and the phone's microphone follows the machine's beat, speeding the lyrics up or slowing them down to match (within 0.5–1.5× of the base tempo). With no base tempo yet, the first steady beat it hears becomes the base. It needs a few seconds of steady beat, reacts to a tempo change in about 7 seconds, and pauses for 8 seconds after you change the tempo by hand. Runs entirely on the phone; nothing is recorded or sent anywhere. Needs the page on https (GitHub Pages is fine).
