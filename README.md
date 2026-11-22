@@ -20,19 +20,17 @@ Open `index.html` in a browser, or host it on any static host (e.g. GitHub Pages
 
 | Path | What it is |
 | --- | --- |
-| `src/karaoke-sync.html` | Source page. Edit this. Contains a `/*BOOTSTRAP*/` placeholder. |
-| `build.mjs` | Inlines Bootstrap 4.6.2 CSS into the source. |
-| `index.html` | Built standalone page. Committed so GitHub Pages works without a build step. |
-| `build/artifact.html` | Built body-only page for publishing as a Claude artifact (not committed). |
+| `index.html` | The page and its source. Edit this. Bootstrap 4.6.2 CSS is inlined, so it works on GitHub Pages without a build step. |
+| `build.mjs` | Copies the `<body>` of `index.html` to `build/artifact.html`. |
+| `build/artifact.html` | Body-only page for publishing as a Claude artifact (not committed). |
 
 ## Building
 
+Only needed for the Claude artifact version. There are no dependencies to install.
+
 ```sh
-npm install
 npm run build
 ```
-
-Commit `src/karaoke-sync.html` and the rebuilt `index.html` together.
 
 ## Credits
 

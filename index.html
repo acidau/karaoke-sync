@@ -33,7 +33,9 @@
 html,body{height:100%}
 body{background:var(--bg);color:var(--fg);overflow:hidden;-webkit-tap-highlight-color:transparent}
 body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:1040;background:#343a40}
-.app{height:100%;display:grid;grid-template-rows:auto 1fr auto}
+/* minmax(0,1fr): without an explicit column the implicit track is auto-sized and grows to the
+   navbar's nowrap title, widening the whole page (phones then zoom out and the lyrics shrink). */
+.app{height:100%;display:grid;grid-template-rows:auto 1fr auto;grid-template-columns:minmax(0,1fr)}
 .gut{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
 .text-muted{color:var(--muted)!important}
 
